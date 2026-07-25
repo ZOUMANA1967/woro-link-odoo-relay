@@ -67,12 +67,43 @@ async function odooAuthenticate() {
 // ---------------------------------------------------------------------------
 // La synchronisation : va chercher tous les produits vendables dans Odoo
 // et remplace le contenu de la copie en memoire.
+//
+// IMPORTANT : Odoo a DEUX systemes de categories differents :
+//   - categ_id          -> categorie "interne" (comptabilite/gestion)
+//   - public_categ_ids  -> categorie(s) "boutique en ligne", celles qui
+//                          contiennent les sous-categories vues sur le site
+// On utilise desormais public_categ_ids pour que l'app retrouve les memes
+// sous-categories que sur www.z-reseaux.com.
 // ---------------------------------------------------------------------------
 async function syncFromOdoo() {
   console.log(`[sync] Debut de la copie depuis Odoo -- ${new Date().toISOString()}`);
   try {
     const uid = await odooAuthenticate();
 
+    // 1) Recupere TOUTES les categories "boutique en ligne", pour pouvoir
+    // reconstruire le chemin complet (Parent / Enfant) de chacune.
+    const publicCategories = await odooCall("object", "execute_kw", [
+      ODOO_DB, uid, ODOO_API_KEY,
+      "product.public.category", "search_read",
+      [[]],
+      { fields: ["name", "parent_id"] },
+    ]);
+    const categoryById = {};
+    for (const cat of publicCategories) categoryById[cat.id] = cat;
+
+    function fullPathFor(catId) {
+      const parts = [];
+      let current = categoryById[catId];
+      let guard = 0;
+      while (current && guard < 10) {
+        parts.unshift(current.name);
+        current = current.parent_id ? categoryById[current.parent_id[0]] : null;
+        guard++;
+      }
+      return parts.join(" / ");
+    }
+
+    // 2) Recupere les produits, avec leur(s) categorie(s) boutique en ligne
     const allProducts = [];
     const pageSize = 500;
     let offset = 0;
@@ -86,7 +117,7 @@ async function syncFromOdoo() {
         "search_read",
         [[["sale_ok", "=", true]]],
         {
-          fields: ["name", "list_price", "default_code", "categ_id", "qty_available"],
+          fields: ["name", "list_price", "default_code", "categ_id", "qty_available", "public_categ_ids", "description_sale"],
           limit: pageSize,
           offset,
           order: "id asc",
@@ -98,14 +129,29 @@ async function syncFromOdoo() {
     }
 
     cache = {
-      products: allProducts.map((p) => ({
-        id: String(p.id),
-        ref: p.default_code || null,
-        name: p.name,
-        price: Math.round(p.list_price),
-        category: p.categ_id ? p.categ_id[1] : null,
-        stock: p.qty_available,
-      })),
+      products: allProducts.map((p) => {
+        // Categorie boutique en ligne (avec sous-categorie) si elle existe,
+        // sinon on retombe sur la categorie interne pour ne rien perdre.
+        let category = null;
+        if (p.public_categ_ids && p.public_categ_ids.length > 0) {
+          category = fullPathFor(p.public_categ_ids[0]);
+        } else if (p.categ_id) {
+          category = p.categ_id[1];
+        }
+        return {
+          id: String(p.id),
+          ref: p.default_code || null,
+          name: p.name,
+          price: Math.round(p.list_price),
+          category,
+          stock: p.qty_available,
+          // Image du produit -- Odoo expose ses images via cette adresse
+          // publique, pas besoin de les televerser ailleurs.
+          image: `${ODOO_URL}/web/image/product.template/${p.id}/image_512`,
+          // Description commerciale, telle qu'ecrite dans Odoo (onglet Ventes).
+          description: p.description_sale || null,
+        };
+      }),
       lastSyncAt: new Date().toISOString(),
       lastSyncOk: true,
       lastError: null,
