@@ -117,7 +117,7 @@ async function syncFromOdoo() {
         "search_read",
         [[["sale_ok", "=", true]]],
         {
-          fields: ["name", "list_price", "default_code", "categ_id", "qty_available", "public_categ_ids", "description_sale"],
+          fields: ["name", "list_price", "default_code", "categ_id", "qty_available", "public_categ_ids", "description_sale", "description"],
           limit: pageSize,
           offset,
           order: "id asc",
@@ -148,8 +148,9 @@ async function syncFromOdoo() {
           // Image du produit -- Odoo expose ses images via cette adresse
           // publique, pas besoin de les televerser ailleurs.
           image: `${ODOO_URL}/web/image/product.template/${p.id}/image_512`,
-          // Description commerciale, telle qu'ecrite dans Odoo (onglet Ventes).
-          description: p.description_sale || null,
+          // Description commerciale si elle existe, sinon la description
+          // interne (Odoo a deux champs "Description" differents selon l'onglet).
+          description: p.description_sale || p.description || null,
         };
       }),
       lastSyncAt: new Date().toISOString(),
