@@ -206,6 +206,24 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Outil de diagnostic : affiche TOUS les champs bruts d'un produit precis,
+// pour trouver le bon nom de champ sans avoir a redeployer a chaque essai.
+// Usage : /api/debug-product/3162
+app.get("/api/debug-product/:id", async (req, res) => {
+  try {
+    const uid = await odooAuthenticate();
+    const result = await odooCall("object", "execute_kw", [
+      ODOO_DB, uid, ODOO_API_KEY,
+      "product.template", "read",
+      [[parseInt(req.params.id)]],
+      {},
+    ]);
+    res.json(result[0] || {});
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Permet de forcer une copie immediate sans attendre le prochain cycle
 // (utile juste apres avoir modifie des prix ou des descriptions dans Odoo).
 // Version GET : pratique pour la declencher juste en ouvrant l'adresse
