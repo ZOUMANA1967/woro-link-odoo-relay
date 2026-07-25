@@ -206,7 +206,13 @@ app.get("/api/health", (req, res) => {
 });
 
 // Permet de forcer une copie immediate sans attendre le prochain cycle
-// (utile juste apres avoir modifie des prix dans Odoo, par exemple).
+// (utile juste apres avoir modifie des prix ou des descriptions dans Odoo).
+// Version GET : pratique pour la declencher juste en ouvrant l'adresse
+// dans un navigateur, sans outil technique.
+app.get("/api/sync-now", async (req, res) => {
+  await syncFromOdoo();
+  res.json({ ok: cache.lastSyncOk, productCount: cache.products.length, lastSyncAt: cache.lastSyncAt });
+});
 app.post("/api/sync-now", async (req, res) => {
   await syncFromOdoo();
   res.json({ ok: cache.lastSyncOk, productCount: cache.products.length, lastSyncAt: cache.lastSyncAt });
