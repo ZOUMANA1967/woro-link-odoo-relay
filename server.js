@@ -40,6 +40,23 @@ let cache = {
 // ---------------------------------------------------------------------------
 // Communication avec Odoo (JSON-RPC)
 // ---------------------------------------------------------------------------
+// Nettoie le HTML d'Odoo (balises, entites) pour n'en garder que le texte,
+// afin de l'afficher simplement dans l'app.
+function stripHtml(html) {
+  if (!html) return null;
+  const text = html
+    .replace(/<\/(p|div|h[1-6]|li|br)>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text.length > 0 ? text : null;
+}
+
 async function odooCall(service, method, args) {
   const res = await fetch(`${ODOO_URL}/jsonrpc`, {
     method: "POST",
@@ -117,7 +134,7 @@ async function syncFromOdoo() {
         "search_read",
         [[["sale_ok", "=", true]]],
         {
-          fields: ["name", "list_price", "default_code", "categ_id", "qty_available", "public_categ_ids", "description_sale", "description"],
+          fields: ["name", "list_price", "default_code", "categ_id", "qty_available", "public_categ_ids", "website_description"],
           limit: pageSize,
           offset,
           order: "id asc",
@@ -148,9 +165,10 @@ async function syncFromOdoo() {
           // Image du produit -- Odoo expose ses images via cette adresse
           // publique, pas besoin de les televerser ailleurs.
           image: `${ODOO_URL}/web/image/product.template/${p.id}/image_512`,
-          // Description commerciale si elle existe, sinon la description
-          // interne (Odoo a deux champs "Description" differents selon l'onglet).
-          description: p.description_sale || p.description || null,
+          // Description commerciale -- vient du champ "website_description"
+          // d'Odoo (celui utilise par la boutique en ligne), qui contient du
+          // HTML : on le nettoie pour n'en garder que le texte lisible.
+          description: stripHtml(p.website_description),
         };
       }),
       lastSyncAt: new Date().toISOString(),
