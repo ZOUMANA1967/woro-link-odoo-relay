@@ -27,6 +27,21 @@ const ODOO_USERNAME = process.env.ODOO_USERNAME;
 const ODOO_API_KEY = process.env.ODOO_API_KEY;
 const SYNC_INTERVAL_MINUTES = parseInt(process.env.SYNC_INTERVAL_MINUTES) || 60;
 const ADMIN_KEY = process.env.ADMIN_KEY || null;
+const APP_KEY = process.env.APP_KEY || null;
+
+// Verifie que l'appel vient bien de votre app (cle partagee simple, envoyee
+// dans l'en-tete X-App-Key). Protection legere -- elle empeche les visites
+// aleatoires de robots de polluer vos statistiques/commandes, mais comme
+// cette cle vit dans le code de l'app affiche dans le navigateur, une
+// personne technique determinee pourrait la retrouver. Pour une vraie
+// securite de paiement, il faudra un jour un systeme de comptes complet.
+function requireAppKey(req, res, next) {
+  if (!APP_KEY) return next(); // si pas configuree, on n'exige rien (retro-compatible)
+  if (req.headers["x-app-key"] !== APP_KEY) {
+    return res.status(401).json({ error: "Cle d'application manquante ou incorrecte." });
+  }
+  next();
+}
 
 // ---------------------------------------------------------------------------
 // Donnees du panneau d'administration -- gardees simplement en memoire,
@@ -249,16 +264,50 @@ app.get("/api/health", (req, res) => {
 
 // Enregistre une visite (l'app appelle cette route a l'ouverture).
 // Sert juste a avoir une idee de frequentation par boutique, rien de plus.
-app.post("/api/visits", (req, res) => {
+app.post("/api/visits", requireAppKey, (req, res) => {
   const siteKey = req.body?.siteKey || "inconnu";
   visitsBySite[siteKey] = (visitsBySite[siteKey] || 0) + 1;
   res.json({ ok: true });
 });
 
-// Enregistre une commande passee dans l'app (pour l'instant juste gardee en
-// memoire cote relais -- ne cree PAS encore de vraie commande dans Odoo,
-// c'est une prochaine etape).
-app.post("/api/orders", (req, res) => {
+// Cherche un client existant par telephone, sinon en cree un nouveau.
+async function findOrCreatePartner(uid, name, phone) {
+  if (phone) {
+    const existing = await odooCall("object", "execute_kw", [
+      ODOO_DB, uid, ODOO_API_KEY, "res.partner", "search_read",
+      [[["phone", "=", phone]]],
+      { fields: ["id"], limit: 1 },
+    ]);
+    if (existing.length > 0) return existing[0].id;
+  }
+  const newId = await odooCall("object", "execute_kw", [
+    ODOO_DB, uid, ODOO_API_KEY, "res.partner", "create",
+    [{ name: name || "Client app WORO-LINK", phone: phone || false }],
+  ]);
+  return newId;
+}
+
+// Cree une vraie commande dans Odoo (etat "Devis" / brouillon -- rien n'est
+// confirme ni facture automatiquement, quelqu'un doit la valider dans Odoo).
+async function createOdooSaleOrder(order) {
+  const uid = await odooAuthenticate();
+  const partnerId = await findOrCreatePartner(uid, order.customerName, order.customerPhone);
+  const orderLines = order.items.map((it) => [
+    0, 0,
+    { product_id: parseInt(it.id), product_uom_qty: it.qty || 1, price_unit: it.price || 0 },
+  ]);
+  const saleOrderId = await odooCall("object", "execute_kw", [
+    ODOO_DB, uid, ODOO_API_KEY, "sale.order", "create",
+    [{ partner_id: partnerId, order_line: orderLines }],
+  ]);
+  return saleOrderId;
+}
+
+// Enregistre une commande passee dans l'app : la garde en memoire pour le
+// panneau d'administration, ET tente de creer un vrai devis dans Odoo.
+// Si Odoo est injoignable, la commande reste quand meme visible dans le
+// panneau (avec une pastille d'erreur), pour ne rien perdre.
+app.post("/api/orders", requireAppKey, async (req, res) => {
   const { siteKey, items, total, customerName, customerPhone } = req.body || {};
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "Commande vide ou invalide." });
@@ -271,10 +320,22 @@ app.post("/api/orders", (req, res) => {
     customerName: customerName || null,
     customerPhone: customerPhone || null,
     createdAt: new Date().toISOString(),
+    odooOk: false,
+    odooOrderId: null,
+    odooError: null,
   };
+
+  try {
+    order.odooOrderId = await createOdooSaleOrder(order);
+    order.odooOk = true;
+  } catch (err) {
+    order.odooError = err.message;
+    console.error("[orders] Echec de creation du devis Odoo:", err.message);
+  }
+
   orders.unshift(order);
   if (orders.length > 500) orders = orders.slice(0, 500); // garde-fou memoire
-  res.json({ ok: true, orderId: order.id });
+  res.json({ ok: true, orderId: order.id, odooOk: order.odooOk, odooOrderId: order.odooOrderId });
 });
 
 // Calcule l'etat de completude du catalogue : combien de produits ont une
@@ -323,6 +384,7 @@ app.get("/api/admin/stats", requireAdmin, (req, res) => {
     catalog: computeCatalogStats(),
     visitsBySite,
     orderCount: orders.length,
+    odooOrderCount: orders.filter((o) => o.odooOk).length,
     revenueTotal: orders.reduce((s, o) => s + (o.total || 0), 0),
   });
 });
@@ -430,7 +492,7 @@ const ADMIN_HTML = `<!doctype html>
   <table id="visitsTable"><thead><tr><th>Boutique</th><th>Visites</th></tr></thead><tbody></tbody></table>
 
   <h2>Dernières commandes</h2>
-  <table id="ordersTable"><thead><tr><th>#</th><th>Boutique</th><th>Client</th><th>Total</th><th>Date</th></tr></thead><tbody></tbody></table>
+  <table id="ordersTable"><thead><tr><th>#</th><th>Boutique</th><th>Client</th><th>Total</th><th>Odoo</th><th>Date</th></tr></thead><tbody></tbody></table>
 </div>
 
 <script>
@@ -467,6 +529,7 @@ async function loadDashboard() {
       card('Produits synchronisés', stats.sync.productCount, stats.sync.lastSyncOk ? 'ok' : 'err'),
       card('Avec sous-catégorie', stats.catalog.withSubcategory + ' / ' + stats.catalog.totalProducts),
       card('Commandes enregistrées', stats.orderCount),
+      card('Devis créés dans Odoo', stats.odooOrderCount + ' / ' + stats.orderCount, stats.odooOrderCount === stats.orderCount ? 'ok' : 'err'),
       card('Chiffre cumulé (F CFA)', Number(stats.revenueTotal).toLocaleString('fr-FR')),
     ].join('');
 
@@ -486,10 +549,13 @@ async function loadDashboard() {
     const ordersBody = document.querySelector('#ordersTable tbody');
     ordersBody.innerHTML = ordersData.orders.length
       ? ordersData.orders.map(function(o) {
+          const odooCell = o.odooOk
+            ? '<span style="color:#5C7A52;">✓ Devis #' + o.odooOrderId + '</span>'
+            : '<span style="color:#C1592B;" title="' + (o.odooError || '') + '">✗ échec</span>';
           return '<tr><td>#' + o.id + '</td><td>' + o.siteKey + '</td><td>' + (o.customerName || '—') + '</td>' +
-            '<td>' + Number(o.total).toLocaleString('fr-FR') + ' F</td><td>' + new Date(o.createdAt).toLocaleString('fr-FR') + '</td></tr>';
+            '<td>' + Number(o.total).toLocaleString('fr-FR') + ' F</td><td>' + odooCell + '</td><td>' + new Date(o.createdAt).toLocaleString('fr-FR') + '</td></tr>';
         }).join('')
-      : '<tr><td colspan="5">Aucune commande enregistrée pour le moment.</td></tr>';
+      : '<tr><td colspan="6">Aucune commande enregistrée pour le moment.</td></tr>';
   } catch (err) {
     document.getElementById('keyError').textContent = 'Erreur : ' + err.message;
   }
