@@ -271,32 +271,33 @@ app.post("/api/visits", requireAppKey, (req, res) => {
 });
 
 // Cherche un client existant par telephone, sinon en cree un nouveau.
+// Carnet d'adresses du relais : garde le lien telephone -> contact Odoo,
+// mais UNIQUEMENT pour les contacts que le relais a lui-meme crees depuis
+// l'app. On ne va jamais chercher/modifier un contact deja existant dans
+// Odoo (fournisseur, autre client, fiche de l'entreprise...) pour eviter
+// d'ecraser des donnees qui n'ont rien a voir.
+// Limite connue : si le relais redemarre (offre gratuite Render), ce carnet
+// se vide et un client qui recommande une seconde fois aura un nouveau
+// contact cree plutot que de retrouver le precedent -- compromis assume
+// pour ne jamais toucher a des donnees existantes.
+let partnerIdByPhone = {};
+
 async function findOrCreatePartner(uid, name, phone, address) {
-  if (phone) {
-    const existing = await odooCall("object", "execute_kw", [
-      ODOO_DB, uid, ODOO_API_KEY, "res.partner", "search_read",
-      [[["phone", "=", phone]]],
-      { fields: ["id", "name", "street"], limit: 1 },
+  if (phone && partnerIdByPhone[phone]) {
+    // Deja cree par le relais lors d'une commande precedente : on met a
+    // jour son nom/adresse sans risque, puisque c'est "notre" contact.
+    const partnerId = partnerIdByPhone[phone];
+    await odooCall("object", "execute_kw", [
+      ODOO_DB, uid, ODOO_API_KEY, "res.partner", "write",
+      [[partnerId], { name: name || "Client app WORO-LINK", street: address || false }],
     ]);
-    if (existing.length > 0) {
-      // Contact deja connu : on met a jour son nom/adresse avec ce que le
-      // client vient de taper, pour que ce soit bien ce qui apparait dans Odoo.
-      const updates = {};
-      if (name && name !== existing[0].name) updates.name = name;
-      if (address && address !== existing[0].street) updates.street = address;
-      if (Object.keys(updates).length > 0) {
-        await odooCall("object", "execute_kw", [
-          ODOO_DB, uid, ODOO_API_KEY, "res.partner", "write",
-          [[existing[0].id], updates],
-        ]);
-      }
-      return existing[0].id;
-    }
+    return partnerId;
   }
   const newId = await odooCall("object", "execute_kw", [
     ODOO_DB, uid, ODOO_API_KEY, "res.partner", "create",
     [{ name: name || "Client app WORO-LINK", phone: phone || false, street: address || false }],
   ]);
+  if (phone) partnerIdByPhone[phone] = newId;
   return newId;
 }
 
