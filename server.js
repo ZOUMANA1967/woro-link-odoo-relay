@@ -314,6 +314,11 @@ async function createOdooSaleOrder(order) {
     ODOO_DB, uid, ODOO_API_KEY, "sale.order", "create",
     [{
       partner_id: partnerId,
+      // Force les blocs "Facturation" et "Livraison" a utiliser ce meme
+      // contact (avec son adresse) -- sans ça, Odoo ne les remplit pas
+      // automatiquement quand la commande est creee par ce chemin technique.
+      partner_invoice_id: partnerId,
+      partner_shipping_id: partnerId,
       order_line: orderLines,
       // Note visible dans Odoo, pour que l'adresse de livraison saisie dans
       // l'app soit toujours lisible meme si elle n'a pas ete structuree.
