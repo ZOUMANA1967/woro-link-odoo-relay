@@ -271,18 +271,31 @@ app.post("/api/visits", requireAppKey, (req, res) => {
 });
 
 // Cherche un client existant par telephone, sinon en cree un nouveau.
-async function findOrCreatePartner(uid, name, phone) {
+async function findOrCreatePartner(uid, name, phone, address) {
   if (phone) {
     const existing = await odooCall("object", "execute_kw", [
       ODOO_DB, uid, ODOO_API_KEY, "res.partner", "search_read",
       [[["phone", "=", phone]]],
-      { fields: ["id"], limit: 1 },
+      { fields: ["id", "name", "street"], limit: 1 },
     ]);
-    if (existing.length > 0) return existing[0].id;
+    if (existing.length > 0) {
+      // Contact deja connu : on met a jour son nom/adresse avec ce que le
+      // client vient de taper, pour que ce soit bien ce qui apparait dans Odoo.
+      const updates = {};
+      if (name && name !== existing[0].name) updates.name = name;
+      if (address && address !== existing[0].street) updates.street = address;
+      if (Object.keys(updates).length > 0) {
+        await odooCall("object", "execute_kw", [
+          ODOO_DB, uid, ODOO_API_KEY, "res.partner", "write",
+          [[existing[0].id], updates],
+        ]);
+      }
+      return existing[0].id;
+    }
   }
   const newId = await odooCall("object", "execute_kw", [
     ODOO_DB, uid, ODOO_API_KEY, "res.partner", "create",
-    [{ name: name || "Client app WORO-LINK", phone: phone || false }],
+    [{ name: name || "Client app WORO-LINK", phone: phone || false, street: address || false }],
   ]);
   return newId;
 }
@@ -291,14 +304,20 @@ async function findOrCreatePartner(uid, name, phone) {
 // confirme ni facture automatiquement, quelqu'un doit la valider dans Odoo).
 async function createOdooSaleOrder(order) {
   const uid = await odooAuthenticate();
-  const partnerId = await findOrCreatePartner(uid, order.customerName, order.customerPhone);
+  const partnerId = await findOrCreatePartner(uid, order.customerName, order.customerPhone, order.deliveryAddress);
   const orderLines = order.items.map((it) => [
     0, 0,
     { product_id: parseInt(it.id), product_uom_qty: it.qty || 1, price_unit: it.price || 0 },
   ]);
   const saleOrderId = await odooCall("object", "execute_kw", [
     ODOO_DB, uid, ODOO_API_KEY, "sale.order", "create",
-    [{ partner_id: partnerId, order_line: orderLines }],
+    [{
+      partner_id: partnerId,
+      order_line: orderLines,
+      // Note visible dans Odoo, pour que l'adresse de livraison saisie dans
+      // l'app soit toujours lisible meme si elle n'a pas ete structuree.
+      note: order.deliveryAddress ? `Adresse de livraison (app) : ${order.deliveryAddress}` : false,
+    }],
   ]);
   return saleOrderId;
 }
@@ -308,7 +327,7 @@ async function createOdooSaleOrder(order) {
 // Si Odoo est injoignable, la commande reste quand meme visible dans le
 // panneau (avec une pastille d'erreur), pour ne rien perdre.
 app.post("/api/orders", requireAppKey, async (req, res) => {
-  const { siteKey, items, total, customerName, customerPhone } = req.body || {};
+  const { siteKey, items, total, customerName, customerPhone, deliveryAddress } = req.body || {};
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "Commande vide ou invalide." });
   }
@@ -319,6 +338,7 @@ app.post("/api/orders", requireAppKey, async (req, res) => {
     total: total || items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0),
     customerName: customerName || null,
     customerPhone: customerPhone || null,
+    deliveryAddress: deliveryAddress || null,
     createdAt: new Date().toISOString(),
     odooOk: false,
     odooOrderId: null,
