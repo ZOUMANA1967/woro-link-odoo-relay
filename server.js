@@ -26,6 +26,29 @@ const ODOO_DB = process.env.ODOO_DB;
 const ODOO_USERNAME = process.env.ODOO_USERNAME;
 const ODOO_API_KEY = process.env.ODOO_API_KEY;
 const SYNC_INTERVAL_MINUTES = parseInt(process.env.SYNC_INTERVAL_MINUTES) || 60;
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+
+// ---------------------------------------------------------------------------
+// Donnees du panneau d'administration -- gardees simplement en memoire,
+// comme le catalogue. Elles repartent a zero si le relais redemarre
+// (offre gratuite Render) ; suffisant pour une premiere version.
+// ---------------------------------------------------------------------------
+let orders = [];
+let visitsBySite = {}; // { "z-reseaux": 12, "teeshopafrica": 4, ... }
+let nextOrderId = 1;
+
+// Verifie la cle d'administration (parametre ?key=... dans l'adresse).
+// Protection simple, pas un vrai systeme de comptes -- suffisant pour un
+// usage interne, mais a ne pas partager publiquement.
+function requireAdmin(req, res, next) {
+  if (!ADMIN_KEY) {
+    return res.status(500).json({ error: "ADMIN_KEY n'est pas configuree sur le relais." });
+  }
+  if (req.query.key !== ADMIN_KEY) {
+    return res.status(401).json({ error: "Cle d'administration manquante ou incorrecte." });
+  }
+  next();
+}
 
 // ---------------------------------------------------------------------------
 // La "copie" -- gardee simplement en memoire, pas de base de donnees a gerer
@@ -224,10 +247,102 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Enregistre une visite (l'app appelle cette route a l'ouverture).
+// Sert juste a avoir une idee de frequentation par boutique, rien de plus.
+app.post("/api/visits", (req, res) => {
+  const siteKey = req.body?.siteKey || "inconnu";
+  visitsBySite[siteKey] = (visitsBySite[siteKey] || 0) + 1;
+  res.json({ ok: true });
+});
+
+// Enregistre une commande passee dans l'app (pour l'instant juste gardee en
+// memoire cote relais -- ne cree PAS encore de vraie commande dans Odoo,
+// c'est une prochaine etape).
+app.post("/api/orders", (req, res) => {
+  const { siteKey, items, total, customerName, customerPhone } = req.body || {};
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "Commande vide ou invalide." });
+  }
+  const order = {
+    id: nextOrderId++,
+    siteKey: siteKey || "inconnu",
+    items,
+    total: total || items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0),
+    customerName: customerName || null,
+    customerPhone: customerPhone || null,
+    createdAt: new Date().toISOString(),
+  };
+  orders.unshift(order);
+  if (orders.length > 500) orders = orders.slice(0, 500); // garde-fou memoire
+  res.json({ ok: true, orderId: order.id });
+});
+
+// Calcule l'etat de completude du catalogue : combien de produits ont une
+// categorie/sous-categorie renseignee, par grande categorie. Sert a savoir
+// ou concentrer le travail de classement dans Odoo.
+function computeCatalogStats() {
+  const perCategory = {};
+  let withCategory = 0;
+  let withSubcategory = 0;
+
+  for (const p of cache.products) {
+    const segments = (p.category || "").split("/").map((s) => s.trim()).filter(Boolean);
+    if (segments.length === 0) continue;
+    withCategory++;
+    const top = segments[0];
+    if (!perCategory[top]) perCategory[top] = { total: 0, withSubcategory: 0 };
+    perCategory[top].total++;
+    if (segments.length >= 2) {
+      withSubcategory++;
+      perCategory[top].withSubcategory++;
+    }
+  }
+
+  const byCategory = Object.entries(perCategory)
+    .map(([name, v]) => ({ name, total: v.total, withSubcategory: v.withSubcategory }))
+    .sort((a, b) => b.total - a.total);
+
+  return {
+    totalProducts: cache.products.length,
+    withCategory,
+    withSubcategory,
+    byCategory,
+  };
+}
+
+// Tableau de bord (donnees) -- protege par cle d'administration.
+app.get("/api/admin/stats", requireAdmin, (req, res) => {
+  res.json({
+    sync: {
+      lastSyncAt: cache.lastSyncAt,
+      lastSyncOk: cache.lastSyncOk,
+      lastError: cache.lastError,
+      productCount: cache.products.length,
+      syncIntervalMinutes: SYNC_INTERVAL_MINUTES,
+    },
+    catalog: computeCatalogStats(),
+    visitsBySite,
+    orderCount: orders.length,
+    revenueTotal: orders.reduce((s, o) => s + (o.total || 0), 0),
+  });
+});
+
+// Liste des commandes -- protegee par cle d'administration.
+app.get("/api/admin/orders", requireAdmin, (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  res.json({ orders: orders.slice(0, limit), total: orders.length });
+});
+
+// Petite page web du panneau d'administration -- pas de build, juste du
+// HTML/JS simple servi directement par le relais.
+app.get("/admin", (req, res) => {
+  res.type("html").send(ADMIN_HTML);
+});
+
 // Outil de diagnostic : affiche TOUS les champs bruts d'un produit precis,
 // pour trouver le bon nom de champ sans avoir a redeployer a chaque essai.
-// Usage : /api/debug-product/3162
-app.get("/api/debug-product/:id", async (req, res) => {
+// Usage : /api/debug-product/3162?key=VOTRE_CLE
+app.get("/api/debug-product/:id", requireAdmin, async (req, res) => {
   try {
     const uid = await odooAuthenticate();
     const result = await odooCall("object", "execute_kw", [
@@ -258,6 +373,138 @@ app.post("/api/sync-now", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Demarrage : une premiere copie tout de suite, puis une copie reguliere
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Panneau d'administration -- page HTML autonome (pas de build necessaire).
+// Demande la cle d'administration, puis affiche l'etat du catalogue, les
+// visites et les commandes.
+// ---------------------------------------------------------------------------
+const ADMIN_HTML = `<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WORO-LINK — Administration</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, 'IBM Plex Sans', sans-serif; background: #F1EBDD; margin: 0; padding: 20px; color: #1B2A3D; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .sub { color: #1B2A3D99; font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: white; border-radius: 12px; padding: 16px; border: 1px solid #1B2A3D14; }
+  .card .label { font-size: 11px; color: #1B2A3D99; text-transform: uppercase; }
+  .card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .card .value.ok { color: #5C7A52; }
+  .card .value.err { color: #C1592B; }
+  table { width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; margin-bottom: 24px; }
+  th, td { text-align: left; padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #1B2A3D0F; }
+  th { background: #1B2A3D; color: white; font-weight: 500; }
+  .bar-bg { background: #1B2A3D14; border-radius: 6px; height: 8px; width: 100%; overflow: hidden; }
+  .bar-fill { background: #5C7A52; height: 100%; }
+  h2 { font-size: 14px; margin: 24px 0 10px; }
+  #keyForm { max-width: 320px; margin: 60px auto; text-align: center; }
+  input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #1B2A3D33; margin-bottom: 10px; }
+  button { width: 100%; padding: 10px; border-radius: 8px; border: none; background: #1B2A3D; color: white; font-weight: 600; cursor: pointer; }
+  .refresh { float: right; font-size: 12px; color: #1B2A3D99; cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<div id="keyForm">
+  <h1>WORO-LINK — Administration</h1>
+  <p class="sub">Entrez la clé d'administration pour accéder au tableau de bord.</p>
+  <input type="password" id="keyInput" placeholder="Clé d'administration" />
+  <button onclick="loadDashboard()">Accéder</button>
+  <p id="keyError" style="color:#C1592B; font-size:12px;"></p>
+</div>
+
+<div id="dashboard" style="display:none;">
+  <h1>WORO-LINK — Administration <span class="refresh" onclick="loadDashboard()">↻ actualiser</span></h1>
+  <p class="sub" id="syncLine"></p>
+
+  <div class="grid" id="statCards"></div>
+
+  <h2>Complétude du catalogue par catégorie</h2>
+  <table id="catalogTable"><thead><tr><th>Catégorie</th><th>Produits</th><th>Avec sous-catégorie</th><th></th></tr></thead><tbody></tbody></table>
+
+  <h2>Visites par boutique</h2>
+  <table id="visitsTable"><thead><tr><th>Boutique</th><th>Visites</th></tr></thead><tbody></tbody></table>
+
+  <h2>Dernières commandes</h2>
+  <table id="ordersTable"><thead><tr><th>#</th><th>Boutique</th><th>Client</th><th>Total</th><th>Date</th></tr></thead><tbody></tbody></table>
+</div>
+
+<script>
+function getKey() {
+  return localStorage.getItem('woroAdminKey') || '';
+}
+
+async function loadDashboard() {
+  const inputEl = document.getElementById('keyInput');
+  const key = inputEl ? inputEl.value.trim() : getKey();
+  if (!key) return;
+  localStorage.setItem('woroAdminKey', key);
+
+  try {
+    const [statsRes, ordersRes] = await Promise.all([
+      fetch('/api/admin/stats?key=' + encodeURIComponent(key)),
+      fetch('/api/admin/orders?key=' + encodeURIComponent(key) + '&limit=20'),
+    ]);
+    if (statsRes.status === 401) {
+      document.getElementById('keyError').textContent = 'Clé incorrecte.';
+      return;
+    }
+    const stats = await statsRes.json();
+    const ordersData = await ordersRes.json();
+
+    document.getElementById('keyForm').style.display = 'none';
+    document.getElementById('dashboard').style.display = 'block';
+
+    document.getElementById('syncLine').textContent =
+      'Dernière synchro : ' + (stats.sync.lastSyncAt ? new Date(stats.sync.lastSyncAt).toLocaleString('fr-FR') : 'jamais') +
+      (stats.sync.lastSyncOk ? ' — OK' : ' — ÉCHEC : ' + stats.sync.lastError);
+
+    document.getElementById('statCards').innerHTML = [
+      card('Produits synchronisés', stats.sync.productCount, stats.sync.lastSyncOk ? 'ok' : 'err'),
+      card('Avec sous-catégorie', stats.catalog.withSubcategory + ' / ' + stats.catalog.totalProducts),
+      card('Commandes enregistrées', stats.orderCount),
+      card('Chiffre cumulé (F CFA)', Number(stats.revenueTotal).toLocaleString('fr-FR')),
+    ].join('');
+
+    const catBody = document.querySelector('#catalogTable tbody');
+    catBody.innerHTML = stats.catalog.byCategory.map(function(c) {
+      const pct = c.total > 0 ? Math.round((c.withSubcategory / c.total) * 100) : 0;
+      return '<tr><td>' + c.name + '</td><td>' + c.total + '</td><td>' + c.withSubcategory + ' (' + pct + '%)</td>' +
+        '<td><div class="bar-bg"><div class="bar-fill" style="width:' + pct + '%"></div></div></td></tr>';
+    }).join('');
+
+    const visitsBody = document.querySelector('#visitsTable tbody');
+    const visitEntries = Object.entries(stats.visitsBySite || {});
+    visitsBody.innerHTML = visitEntries.length
+      ? visitEntries.map(function(e) { return '<tr><td>' + e[0] + '</td><td>' + e[1] + '</td></tr>'; }).join('')
+      : '<tr><td colspan="2">Aucune visite enregistrée pour le moment.</td></tr>';
+
+    const ordersBody = document.querySelector('#ordersTable tbody');
+    ordersBody.innerHTML = ordersData.orders.length
+      ? ordersData.orders.map(function(o) {
+          return '<tr><td>#' + o.id + '</td><td>' + o.siteKey + '</td><td>' + (o.customerName || '—') + '</td>' +
+            '<td>' + Number(o.total).toLocaleString('fr-FR') + ' F</td><td>' + new Date(o.createdAt).toLocaleString('fr-FR') + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="5">Aucune commande enregistrée pour le moment.</td></tr>';
+  } catch (err) {
+    document.getElementById('keyError').textContent = 'Erreur : ' + err.message;
+  }
+}
+
+function card(label, value, cls) {
+  return '<div class="card"><div class="label">' + label + '</div><div class="value ' + (cls || '') + '">' + value + '</div></div>';
+}
+
+// Si une cle est deja enregistree, on charge directement
+if (getKey()) { loadDashboard(); }
+</script>
+</body>
+</html>`;
+
 app.listen(PORT, () => {
   console.log(`Relais WORO-LINK <-> Odoo demarre sur le port ${PORT}`);
   syncFromOdoo();
