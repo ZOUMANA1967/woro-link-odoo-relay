@@ -282,20 +282,20 @@ app.post("/api/visits", requireAppKey, (req, res) => {
 // pour ne jamais toucher a des donnees existantes.
 let partnerIdByPhone = {};
 
-async function findOrCreatePartner(uid, name, phone, address) {
+async function findOrCreatePartner(uid, name, phone, address, email) {
   if (phone && partnerIdByPhone[phone]) {
     // Deja cree par le relais lors d'une commande precedente : on met a
-    // jour son nom/adresse sans risque, puisque c'est "notre" contact.
+    // jour son nom/adresse/email sans risque, puisque c'est "notre" contact.
     const partnerId = partnerIdByPhone[phone];
     await odooCall("object", "execute_kw", [
       ODOO_DB, uid, ODOO_API_KEY, "res.partner", "write",
-      [[partnerId], { name: name || "Client app WORO-LINK", street: address || false }],
+      [[partnerId], { name: name || "Client app WORO-LINK", street: address || false, email: email || false }],
     ]);
     return partnerId;
   }
   const newId = await odooCall("object", "execute_kw", [
     ODOO_DB, uid, ODOO_API_KEY, "res.partner", "create",
-    [{ name: name || "Client app WORO-LINK", phone: phone || false, street: address || false }],
+    [{ name: name || "Client app WORO-LINK", phone: phone || false, street: address || false, email: email || false }],
   ]);
   if (phone) partnerIdByPhone[phone] = newId;
   return newId;
@@ -305,7 +305,7 @@ async function findOrCreatePartner(uid, name, phone, address) {
 // confirme ni facture automatiquement, quelqu'un doit la valider dans Odoo).
 async function createOdooSaleOrder(order) {
   const uid = await odooAuthenticate();
-  const partnerId = await findOrCreatePartner(uid, order.customerName, order.customerPhone, order.deliveryAddress);
+  const partnerId = await findOrCreatePartner(uid, order.customerName, order.customerPhone, order.deliveryAddress, order.customerEmail);
   const orderLines = order.items.map((it) => [
     0, 0,
     { product_id: parseInt(it.id), product_uom_qty: it.qty || 1, price_unit: it.price || 0 },
@@ -333,7 +333,7 @@ async function createOdooSaleOrder(order) {
 // Si Odoo est injoignable, la commande reste quand meme visible dans le
 // panneau (avec une pastille d'erreur), pour ne rien perdre.
 app.post("/api/orders", requireAppKey, async (req, res) => {
-  const { siteKey, items, total, customerName, customerPhone, deliveryAddress } = req.body || {};
+  const { siteKey, items, total, customerName, customerPhone, customerEmail, deliveryAddress } = req.body || {};
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "Commande vide ou invalide." });
   }
@@ -344,6 +344,7 @@ app.post("/api/orders", requireAppKey, async (req, res) => {
     total: total || items.reduce((s, it) => s + (it.price || 0) * (it.qty || 1), 0),
     customerName: customerName || null,
     customerPhone: customerPhone || null,
+    customerEmail: customerEmail || null,
     deliveryAddress: deliveryAddress || null,
     createdAt: new Date().toISOString(),
     odooOk: false,
@@ -419,6 +420,26 @@ app.get("/api/admin/stats", requireAdmin, (req, res) => {
 app.get("/api/admin/orders", requireAdmin, (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   res.json({ orders: orders.slice(0, limit), total: orders.length });
+});
+
+// Historique de commandes d'un client -- utilise par l'ecran "Mon compte"
+// de l'app. Identification simple par numero de telephone (pas de mot de
+// passe pour l'instant), protegee par la cle d'application comme le reste
+// des appels venant de l'app.
+app.get("/api/my-orders", requireAppKey, (req, res) => {
+  const phone = (req.query.phone || "").trim();
+  if (!phone) return res.status(400).json({ error: "Numero de telephone manquant." });
+  const mine = orders
+    .filter((o) => o.customerPhone === phone)
+    .map((o) => ({
+      id: o.id,
+      items: o.items,
+      total: o.total,
+      createdAt: o.createdAt,
+      odooOk: o.odooOk,
+      deliveryAddress: o.deliveryAddress,
+    }));
+  res.json({ orders: mine });
 });
 
 // Petite page web du panneau d'administration -- pas de build, juste du
@@ -518,7 +539,7 @@ const ADMIN_HTML = `<!doctype html>
   <table id="visitsTable"><thead><tr><th>Boutique</th><th>Visites</th></tr></thead><tbody></tbody></table>
 
   <h2>Dernières commandes</h2>
-  <table id="ordersTable"><thead><tr><th>#</th><th>Boutique</th><th>Client</th><th>Total</th><th>Odoo</th><th>Date</th></tr></thead><tbody></tbody></table>
+  <table id="ordersTable"><thead><tr><th>#</th><th>Boutique</th><th>Client</th><th>Email</th><th>Total</th><th>Odoo</th><th>Date</th></tr></thead><tbody></tbody></table>
 </div>
 
 <script>
@@ -579,9 +600,10 @@ async function loadDashboard() {
             ? '<span style="color:#5C7A52;">✓ Devis #' + o.odooOrderId + '</span>'
             : '<span style="color:#C1592B;" title="' + (o.odooError || '') + '">✗ échec</span>';
           return '<tr><td>#' + o.id + '</td><td>' + o.siteKey + '</td><td>' + (o.customerName || '—') + '</td>' +
+            '<td>' + (o.customerEmail || '—') + '</td>' +
             '<td>' + Number(o.total).toLocaleString('fr-FR') + ' F</td><td>' + odooCell + '</td><td>' + new Date(o.createdAt).toLocaleString('fr-FR') + '</td></tr>';
         }).join('')
-      : '<tr><td colspan="6">Aucune commande enregistrée pour le moment.</td></tr>';
+      : '<tr><td colspan="7">Aucune commande enregistrée pour le moment.</td></tr>';
   } catch (err) {
     document.getElementById('keyError').textContent = 'Erreur : ' + err.message;
   }
