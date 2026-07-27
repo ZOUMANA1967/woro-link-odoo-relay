@@ -301,6 +301,11 @@ async function findOrCreatePartner(uid, name, phone, address, email) {
   return newId;
 }
 
+// Marque toutes les commandes creees par l'app, pour pouvoir les
+// retrouver plus tard directement dans Odoo (source durable, contrairement
+// a la memoire du relais qui se vide a chaque redemarrage).
+const ORDER_ORIGIN_TAG = "WORO-LINK App";
+
 // Cree une vraie commande dans Odoo (etat "Devis" / brouillon -- rien n'est
 // confirme ni facture automatiquement, quelqu'un doit la valider dans Odoo).
 async function createOdooSaleOrder(order) {
@@ -323,9 +328,37 @@ async function createOdooSaleOrder(order) {
       // Note visible dans Odoo, pour que l'adresse de livraison saisie dans
       // l'app soit toujours lisible meme si elle n'a pas ete structuree.
       note: order.deliveryAddress ? `Adresse de livraison (app) : ${order.deliveryAddress}` : false,
+      origin: ORDER_ORIGIN_TAG,
     }],
   ]);
   return saleOrderId;
+}
+
+// Va chercher les commandes DIRECTEMENT dans Odoo (source durable) au lieu
+// de la memoire du relais, qui se vide a chaque redemarrage. filtreSupp est
+// un domaine Odoo supplementaire (ex: filtrer par telephone du client).
+async function fetchOrdersFromOdoo(filtreSupp = [], limit = 50) {
+  const uid = await odooAuthenticate();
+  const domain = [["origin", "=", ORDER_ORIGIN_TAG], ...filtreSupp];
+  const results = await odooCall("object", "execute_kw", [
+    ODOO_DB, uid, ODOO_API_KEY, "sale.order", "search_read",
+    [domain],
+    {
+      fields: ["name", "partner_id", "amount_total", "create_date", "state", "note"],
+      limit,
+      order: "create_date desc",
+    },
+  ]);
+  return results.map((o) => ({
+    id: o.id,
+    reference: o.name,
+    customerName: o.partner_id ? o.partner_id[1] : null,
+    total: o.amount_total,
+    createdAt: o.create_date,
+    state: o.state, // "draft" = Devis, "sale" = Commande confirmee, etc.
+    note: o.note || null,
+    odooOk: true,
+  }));
 }
 
 // Enregistre une commande passee dans l'app : la garde en memoire pour le
@@ -399,7 +432,21 @@ function computeCatalogStats() {
 }
 
 // Tableau de bord (donnees) -- protege par cle d'administration.
-app.get("/api/admin/stats", requireAdmin, (req, res) => {
+// Les commandes/chiffre viennent d'Odoo (durable) ; si Odoo est injoignable,
+// on retombe sur la memoire du relais pour ne pas laisser un panneau vide.
+app.get("/api/admin/stats", requireAdmin, async (req, res) => {
+  let orderCount = orders.length;
+  let revenueTotal = orders.reduce((s, o) => s + (o.total || 0), 0);
+  let odooReachable = true;
+  try {
+    const odooOrders = await fetchOrdersFromOdoo([], 1000);
+    orderCount = odooOrders.length;
+    revenueTotal = odooOrders.reduce((s, o) => s + (o.total || 0), 0);
+  } catch (err) {
+    odooReachable = false;
+    console.warn("[admin/stats] Lecture des commandes Odoo impossible, repli sur la memoire:", err.message);
+  }
+
   res.json({
     sync: {
       lastSyncAt: cache.lastSyncAt,
@@ -410,36 +457,50 @@ app.get("/api/admin/stats", requireAdmin, (req, res) => {
     },
     catalog: computeCatalogStats(),
     visitsBySite,
-    orderCount: orders.length,
-    odooOrderCount: orders.filter((o) => o.odooOk).length,
-    revenueTotal: orders.reduce((s, o) => s + (o.total || 0), 0),
+    orderCount,
+    odooOrderCount: odooReachable ? orderCount : orders.filter((o) => o.odooOk).length,
+    odooReachable,
+    revenueTotal,
   });
 });
 
-// Liste des commandes -- protegee par cle d'administration.
-app.get("/api/admin/orders", requireAdmin, (req, res) => {
+// Liste des commandes -- protegee par cle d'administration. Lit Odoo en
+// priorite (durable), repli sur la memoire du relais si Odoo ne repond pas.
+app.get("/api/admin/orders", requireAdmin, async (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
-  res.json({ orders: orders.slice(0, limit), total: orders.length });
+  try {
+    const odooOrders = await fetchOrdersFromOdoo([], limit);
+    return res.json({ orders: odooOrders, total: odooOrders.length, source: "odoo" });
+  } catch (err) {
+    console.warn("[admin/orders] Lecture Odoo impossible, repli sur la memoire:", err.message);
+    res.json({ orders: orders.slice(0, limit), total: orders.length, source: "memoire (Odoo injoignable)" });
+  }
 });
 
 // Historique de commandes d'un client -- utilise par l'ecran "Mon compte"
 // de l'app. Identification simple par numero de telephone (pas de mot de
 // passe pour l'instant), protegee par la cle d'application comme le reste
-// des appels venant de l'app.
-app.get("/api/my-orders", requireAppKey, (req, res) => {
+// des appels venant de l'app. Lit Odoo en priorite (durable).
+app.get("/api/my-orders", requireAppKey, async (req, res) => {
   const phone = (req.query.phone || "").trim();
   if (!phone) return res.status(400).json({ error: "Numero de telephone manquant." });
-  const mine = orders
-    .filter((o) => o.customerPhone === phone)
-    .map((o) => ({
-      id: o.id,
-      items: o.items,
-      total: o.total,
-      createdAt: o.createdAt,
-      odooOk: o.odooOk,
-      deliveryAddress: o.deliveryAddress,
-    }));
-  res.json({ orders: mine });
+  try {
+    const odooOrders = await fetchOrdersFromOdoo([["partner_id.phone", "=", phone]], 50);
+    return res.json({ orders: odooOrders });
+  } catch (err) {
+    console.warn("[my-orders] Lecture Odoo impossible, repli sur la memoire:", err.message);
+    const mine = orders
+      .filter((o) => o.customerPhone === phone)
+      .map((o) => ({
+        id: o.id,
+        items: o.items,
+        total: o.total,
+        createdAt: o.createdAt,
+        odooOk: o.odooOk,
+        deliveryAddress: o.deliveryAddress,
+      }));
+    res.json({ orders: mine });
+  }
 });
 
 // Petite page web du panneau d'administration -- pas de build, juste du
@@ -594,12 +655,16 @@ async function loadDashboard() {
       : '<tr><td colspan="2">Aucune visite enregistrée pour le moment.</td></tr>';
 
     const ordersBody = document.querySelector('#ordersTable tbody');
+    if (ordersData.source) {
+      document.getElementById('syncLine').textContent += ' — commandes lues depuis : ' + ordersData.source;
+    }
     ordersBody.innerHTML = ordersData.orders.length
       ? ordersData.orders.map(function(o) {
+          const ref = o.reference || o.odooOrderId;
           const odooCell = o.odooOk
-            ? '<span style="color:#5C7A52;">✓ Devis #' + o.odooOrderId + '</span>'
+            ? '<span style="color:#5C7A52;">✓ Devis ' + (ref ? '#' + ref : '') + '</span>'
             : '<span style="color:#C1592B;" title="' + (o.odooError || '') + '">✗ échec</span>';
-          return '<tr><td>#' + o.id + '</td><td>' + o.siteKey + '</td><td>' + (o.customerName || '—') + '</td>' +
+          return '<tr><td>#' + o.id + '</td><td>' + (o.siteKey || '—') + '</td><td>' + (o.customerName || '—') + '</td>' +
             '<td>' + (o.customerEmail || '—') + '</td>' +
             '<td>' + Number(o.total).toLocaleString('fr-FR') + ' F</td><td>' + odooCell + '</td><td>' + new Date(o.createdAt).toLocaleString('fr-FR') + '</td></tr>';
         }).join('')
