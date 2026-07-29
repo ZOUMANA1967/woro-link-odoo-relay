@@ -447,7 +447,15 @@ function computeCatalogStats() {
   }
 
   const byCategory = Object.entries(perCategory)
-    .map(([name, v]) => ({ name, total: v.total, withSubcategory: v.withSubcategory }))
+    .map(([name, v]) => ({
+      name,
+      total: v.total,
+      withSubcategory: v.withSubcategory,
+      // Repere les noms du genre "1-RESEAU..." ou "5 OUTILLAGE..." --
+      // ressemblent a d'anciens doublons, mais ce n'est qu'une supposition
+      // basee sur le motif du nom, pas une certitude.
+      probableDoublon: /^\d+[\s.\-]/.test(name.trim()),
+    }))
     .sort((a, b) => b.total - a.total);
 
   return {
@@ -671,7 +679,10 @@ async function loadDashboard() {
     const catBody = document.querySelector('#catalogTable tbody');
     catBody.innerHTML = stats.catalog.byCategory.map(function(c) {
       const pct = c.total > 0 ? Math.round((c.withSubcategory / c.total) * 100) : 0;
-      return '<tr><td>' + c.name + '</td><td>' + c.total + '</td><td>' + c.withSubcategory + ' (' + pct + '%)</td>' +
+      const badge = c.probableDoublon
+        ? ' <span style="background:#C1592B22;color:#C1592B;font-size:9px;padding:1px 6px;border-radius:10px;">probable doublon</span>'
+        : '';
+      return '<tr><td>' + c.name + badge + '</td><td>' + c.total + '</td><td>' + c.withSubcategory + ' (' + pct + '%)</td>' +
         '<td><div class="bar-bg"><div class="bar-fill" style="width:' + pct + '%"></div></div></td></tr>';
     }).join('');
 
