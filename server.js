@@ -71,6 +71,7 @@ function requireAdmin(req, res, next) {
 let cache = {
   products: [],
   categoryImages: {},
+  subcategoryImages: {},
   lastSyncAt: null,
   lastSyncOk: false,
   lastError: null,
@@ -151,9 +152,15 @@ async function syncFromOdoo() {
     // sans parent) -- utilisee pour afficher une vraie photo au lieu d'une
     // simple icone dans l'app.
     const categoryImages = {};
+    // Image de chaque sous-categorie (celles qui ont un parent), indexee
+    // simplement par son propre nom -- suffisant pour notre usage.
+    const subcategoryImages = {};
     for (const cat of publicCategories) {
+      const url = `${ODOO_URL}/web/image/product.public.category/${cat.id}/image_256`;
       if (!cat.parent_id) {
-        categoryImages[cat.name] = `${ODOO_URL}/web/image/product.public.category/${cat.id}/image_256`;
+        categoryImages[cat.name] = url;
+      } else {
+        subcategoryImages[cat.name] = url;
       }
     }
 
@@ -221,6 +228,7 @@ async function syncFromOdoo() {
         };
       }),
       categoryImages,
+      subcategoryImages,
       lastSyncAt: new Date().toISOString(),
       lastSyncOk: true,
       lastError: null,
@@ -265,7 +273,7 @@ app.get("/api/products", (req, res) => {
 // comme les produits. Utilisee par l'app pour afficher une vraie photo au
 // lieu d'une icone sur les tuiles de categories.
 app.get("/api/categories", (req, res) => {
-  res.json({ categoryImages: cache.categoryImages, lastSyncAt: cache.lastSyncAt });
+  res.json({ categoryImages: cache.categoryImages, subcategoryImages: cache.subcategoryImages, lastSyncAt: cache.lastSyncAt });
 });
 
 // Etat du relais et de la derniere copie -- pratique pour verifier que tout va bien
