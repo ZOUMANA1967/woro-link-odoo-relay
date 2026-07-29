@@ -70,6 +70,7 @@ function requireAdmin(req, res, next) {
 // ---------------------------------------------------------------------------
 let cache = {
   products: [],
+  categoryImages: {},
   lastSyncAt: null,
   lastSyncOk: false,
   lastError: null,
@@ -146,6 +147,16 @@ async function syncFromOdoo() {
     const categoryById = {};
     for (const cat of publicCategories) categoryById[cat.id] = cat;
 
+    // Image de chaque grande categorie (les 21 categories de premier niveau,
+    // sans parent) -- utilisee pour afficher une vraie photo au lieu d'une
+    // simple icone dans l'app.
+    const categoryImages = {};
+    for (const cat of publicCategories) {
+      if (!cat.parent_id) {
+        categoryImages[cat.name] = `${ODOO_URL}/web/image/product.public.category/${cat.id}/image_256`;
+      }
+    }
+
     function fullPathFor(catId) {
       const parts = [];
       let current = categoryById[catId];
@@ -209,6 +220,7 @@ async function syncFromOdoo() {
           description: stripHtml(p.website_description),
         };
       }),
+      categoryImages,
       lastSyncAt: new Date().toISOString(),
       lastSyncOk: true,
       lastError: null,
@@ -247,6 +259,13 @@ app.get("/api/products", (req, res) => {
     total: results.length,
     lastSyncAt: cache.lastSyncAt,
   });
+});
+
+// Image de chaque grande categorie -- servie depuis la copie en memoire,
+// comme les produits. Utilisee par l'app pour afficher une vraie photo au
+// lieu d'une icone sur les tuiles de categories.
+app.get("/api/categories", (req, res) => {
+  res.json({ categoryImages: cache.categoryImages, lastSyncAt: cache.lastSyncAt });
 });
 
 // Etat du relais et de la derniere copie -- pratique pour verifier que tout va bien
