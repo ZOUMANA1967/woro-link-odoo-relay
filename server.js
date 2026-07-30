@@ -72,6 +72,7 @@ let cache = {
   products: [],
   categoryImages: {},
   subcategoryImages: {},
+  allCategories: [],
   lastSyncAt: null,
   lastSyncOk: false,
   lastError: null,
@@ -229,6 +230,7 @@ async function syncFromOdoo() {
       }),
       categoryImages,
       subcategoryImages,
+      allCategories: publicCategories,
       lastSyncAt: new Date().toISOString(),
       lastSyncOk: true,
       lastError: null,
@@ -274,6 +276,67 @@ app.get("/api/products", (req, res) => {
 // lieu d'une icone sur les tuiles de categories.
 app.get("/api/categories", (req, res) => {
   res.json({ categoryImages: cache.categoryImages, subcategoryImages: cache.subcategoryImages, lastSyncAt: cache.lastSyncAt });
+});
+
+// Liste brute de TOUTES les categories boutique en ligne (id, nom, parent),
+// avec un compteur de produits -- sert au petit outil de fusion du panneau
+// d'administration, pour choisir "depuis" et "vers" sans se tromper.
+app.get("/api/admin/categories", requireAdmin, (req, res) => {
+  const list = cache.allCategories.map((c) => ({
+    id: c.id,
+    name: c.name,
+    parentId: c.parent_id ? c.parent_id[0] : null,
+    parentName: c.parent_id ? c.parent_id[1] : null,
+  }));
+  res.json({ categories: list });
+});
+
+// Fusionne une categorie (doublon) vers une autre : tous les produits qui
+// avaient l'ancienne se retrouvent avec la nouvelle a la place, en une
+// seule operation cote Odoo. La categorie source elle-meme n'est PAS
+// supprimee automatiquement -- ca reste une action volontaire separee.
+app.post("/api/admin/merge-category", requireAdmin, async (req, res) => {
+  const fromId = parseInt(req.body?.fromId);
+  const toId = parseInt(req.body?.toId);
+  if (!fromId || !toId || fromId === toId) {
+    return res.status(400).json({ error: "Identifiants de categorie invalides." });
+  }
+  try {
+    const uid = await odooAuthenticate();
+    const matched = await odooCall("object", "execute_kw", [
+      ODOO_DB, uid, ODOO_API_KEY, "product.template", "search_read",
+      [[["public_categ_ids", "in", [fromId]]]],
+      { fields: ["id"], limit: 5000 },
+    ]);
+    const ids = matched.map((p) => p.id);
+    if (ids.length > 0) {
+      await odooCall("object", "execute_kw", [
+        ODOO_DB, uid, ODOO_API_KEY, "product.template", "write",
+        [ids, { public_categ_ids: [[3, fromId], [4, toId]] }],
+      ]);
+    }
+    res.json({ ok: true, mergedCount: ids.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Archive une categorie (elle disparait des listes actives dans Odoo, mais
+// n'est pas supprimee definitivement -- reversible). A utiliser une fois
+// qu'une categorie doublon a ete videe via la fusion ci-dessus.
+app.post("/api/admin/archive-category", requireAdmin, async (req, res) => {
+  const categoryId = parseInt(req.body?.categoryId);
+  if (!categoryId) return res.status(400).json({ error: "Identifiant de categorie invalide." });
+  try {
+    const uid = await odooAuthenticate();
+    await odooCall("object", "execute_kw", [
+      ODOO_DB, uid, ODOO_API_KEY, "product.public.category", "write",
+      [[categoryId], { active: false }],
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Etat du relais et de la derniere copie -- pratique pour verifier que tout va bien
@@ -631,6 +694,34 @@ const ADMIN_HTML = `<!doctype html>
   <h2>Complétude du catalogue par catégorie</h2>
   <table id="catalogTable"><thead><tr><th>Catégorie</th><th>Produits</th><th>Avec sous-catégorie</th><th></th></tr></thead><tbody></tbody></table>
 
+  <h2>Fusionner une catégorie doublon</h2>
+  <div class="card" style="margin-bottom:24px;">
+    <p class="sub" style="margin-bottom:12px;">Choisissez la catégorie à vider ("depuis") et celle qui doit la remplacer ("vers"). Tous les produits sont reclassés d'un coup. La catégorie source n'est pas supprimée, seulement vidée.</p>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:end;">
+      <div style="flex:1; min-width:200px;">
+        <label style="font-size:11px; color:#1B2A3D99;">Depuis (le doublon à vider)</label>
+        <select id="mergeFrom" style="width:100%; padding:8px; border-radius:8px; border:1px solid #1B2A3D33;"></select>
+      </div>
+      <div style="flex:1; min-width:200px;">
+        <label style="font-size:11px; color:#1B2A3D99;">Vers (la vraie catégorie)</label>
+        <select id="mergeTo" style="width:100%; padding:8px; border-radius:8px; border:1px solid #1B2A3D33;"></select>
+      </div>
+      <button style="width:auto; padding:10px 18px;" onclick="mergeCategory()">Fusionner</button>
+    </div>
+    <p id="mergeResult" style="font-size:12px; margin-top:10px;"></p>
+    <details style="margin-top:14px;">
+      <summary style="font-size:12px; color:#1B2A3D99; cursor:pointer;">Une fois vidée, archiver la catégorie doublon</summary>
+      <div style="display:flex; gap:10px; margin-top:10px; align-items:end;">
+        <div style="flex:1; min-width:200px;">
+          <label style="font-size:11px; color:#1B2A3D99;">Catégorie à archiver</label>
+          <select id="archiveTarget" style="width:100%; padding:8px; border-radius:8px; border:1px solid #1B2A3D33;"></select>
+        </div>
+        <button style="width:auto; padding:10px 18px; background:#C1592B;" onclick="archiveCategory()">Archiver</button>
+      </div>
+      <p id="archiveResult" style="font-size:12px; margin-top:10px;"></p>
+    </details>
+  </div>
+
   <h2>Visites par boutique</h2>
   <table id="visitsTable"><thead><tr><th>Boutique</th><th>Visites</th></tr></thead><tbody></tbody></table>
 
@@ -707,8 +798,76 @@ async function loadDashboard() {
             '<td>' + Number(o.total).toLocaleString('fr-FR') + ' F</td><td>' + odooCell + '</td><td>' + new Date(o.createdAt).toLocaleString('fr-FR') + '</td></tr>';
         }).join('')
       : '<tr><td colspan="7">Aucune commande enregistrée pour le moment.</td></tr>';
+
+    // Charge la liste des categories pour les menus de fusion/archivage
+    const catRes = await fetch('/api/admin/categories?key=' + encodeURIComponent(key));
+    const catData = await catRes.json();
+    populateCategorySelects(catData.categories || []);
   } catch (err) {
     document.getElementById('keyError').textContent = 'Erreur : ' + err.message;
+  }
+}
+
+function populateCategorySelects(categories) {
+  // Trie par nom pour etre facile a parcourir, avec le nom du parent entre
+  // parentheses pour distinguer les sous-categories qui portent le meme nom.
+  const sorted = [...categories].sort((a, b) => a.name.localeCompare(b.name));
+  const optionsHtml = sorted.map(function(c) {
+    const suffix = c.parentName ? ' (sous ' + c.parentName + ')' : ' (catégorie principale)';
+    return '<option value="' + c.id + '">' + c.name + suffix + '</option>';
+  }).join('');
+  document.getElementById('mergeFrom').innerHTML = optionsHtml;
+  document.getElementById('mergeTo').innerHTML = optionsHtml;
+  document.getElementById('archiveTarget').innerHTML = optionsHtml;
+}
+
+async function mergeCategory() {
+  const key = getKey();
+  const fromId = document.getElementById('mergeFrom').value;
+  const toId = document.getElementById('mergeTo').value;
+  const resultEl = document.getElementById('mergeResult');
+  if (fromId === toId) {
+    resultEl.textContent = 'Choisissez deux catégories différentes.';
+    resultEl.style.color = '#C1592B';
+    return;
+  }
+  resultEl.textContent = 'Fusion en cours…';
+  resultEl.style.color = '#1B2A3D99';
+  try {
+    const res = await fetch('/api/admin/merge-category?key=' + encodeURIComponent(key), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromId, toId }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Erreur inconnue');
+    resultEl.textContent = data.mergedCount + ' produit(s) reclassé(s) avec succès.';
+    resultEl.style.color = '#5C7A52';
+  } catch (err) {
+    resultEl.textContent = 'Erreur : ' + err.message;
+    resultEl.style.color = '#C1592B';
+  }
+}
+
+async function archiveCategory() {
+  const key = getKey();
+  const categoryId = document.getElementById('archiveTarget').value;
+  const resultEl = document.getElementById('archiveResult');
+  resultEl.textContent = 'Archivage en cours…';
+  resultEl.style.color = '#1B2A3D99';
+  try {
+    const res = await fetch('/api/admin/archive-category?key=' + encodeURIComponent(key), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ categoryId }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Erreur inconnue');
+    resultEl.textContent = 'Catégorie archivée.';
+    resultEl.style.color = '#5C7A52';
+  } catch (err) {
+    resultEl.textContent = 'Erreur : ' + err.message;
+    resultEl.style.color = '#C1592B';
   }
 }
 
